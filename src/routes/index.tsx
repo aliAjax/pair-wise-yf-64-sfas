@@ -1,63 +1,24 @@
 import { $, component$, useSignal, useStore, useVisibleTask$ } from '@builder.io/qwik';
 import { Progress } from '@qwik-ui/headless';
-import { QueryClient } from '@tanstack/query-core';
-import { useForm, zodForm$ } from '@modular-forms/qwik';
+import { reset, useForm, zodForm$ } from '@modular-forms/qwik';
 import { useSpeakLocale } from 'qwik-speak';
 import { z } from 'zod';
 import type { DocumentHead } from '@builder.io/qwik-city';
-
-type SpeechStatus = 'queued' | 'speaking' | 'done' | 'skipped';
-type InterpreterStatus = 'active' | 'handoff' | 'standby';
-type Room = { id: string; name: string; topic: string; simultaneousChannels: number };
-type Speech = { id: string; roomId: string; speaker: string; delegation: string; language: string; topic: string; plannedSeconds: number; remainingSeconds: number; status: SpeechStatus; updatedAt: string };
-type Channel = { id: string; roomId: string; language: string; interpreter: string; status: InterpreterStatus; health: number };
-type Term = { id: string; phrase: string; translation: string; language: string; approved: boolean };
-type Caption = { id: string; speechId: string; roomId: string; language: string; interpreter: string; text: string; revision: number; at: string };
-type Audit = { id: string; at: string; roomId: string; message: string };
-
-interface ConferenceState {
-  rooms: Room[];
-  activeRoomId: string;
-  speechQueue: Speech[];
-  channels: Channel[];
-  terms: Term[];
-  captions: Caption[];
-  audits: Audit[];
-  lowLatency: boolean;
-}
-
-const now = new Date().toISOString();
-const seed: ConferenceState = {
-  rooms: [
-    { id: 'hall-a', name: 'A厅 · 全体会议', topic: '全球气候融资', simultaneousChannels: 6 },
-    { id: 'hall-b', name: 'B厅 · 技术分会', topic: '人工智能基础设施', simultaneousChannels: 4 }
-  ],
-  activeRoomId: 'hall-a',
-  speechQueue: [
-    { id: 'speech-1', roomId: 'hall-a', speaker: 'Amina Diallo', delegation: '塞内加尔', language: '英语', topic: '适应性融资缺口', plannedSeconds: 600, remainingSeconds: 214, status: 'speaking', updatedAt: now },
-    { id: 'speech-2', roomId: 'hall-a', speaker: '李明远', delegation: '中国', language: '中文', topic: '绿色基础设施机制', plannedSeconds: 600, remainingSeconds: 600, status: 'queued', updatedAt: now },
-    { id: 'speech-3', roomId: 'hall-b', speaker: 'Maria Silva', delegation: '巴西', language: '葡萄牙语', topic: '边缘算力与能源', plannedSeconds: 420, remainingSeconds: 420, status: 'queued', updatedAt: now }
-  ],
-  channels: [
-    { id: 'ch-a-zh', roomId: 'hall-a', language: '中文', interpreter: '周雨', status: 'active', health: 96 },
-    { id: 'ch-a-es', roomId: 'hall-a', language: '西班牙语', interpreter: 'Lucía M.', status: 'active', health: 91 },
-    { id: 'ch-a-fr', roomId: 'hall-a', language: '法语', interpreter: 'Noah B.', status: 'standby', health: 88 },
-    { id: 'ch-b-zh', roomId: 'hall-b', language: '中文', interpreter: '何佳', status: 'active', health: 94 }
-  ],
-  terms: [
-    { id: 'term-1', phrase: 'loss and damage', translation: '损失与损害', language: '中文', approved: true },
-    { id: 'term-2', phrase: 'edge inference', translation: '边缘推理', language: '中文', approved: true },
-    { id: 'term-3', phrase: 'just transition', translation: '公正转型', language: '中文', approved: false }
-  ],
-  captions: [
-    { id: 'caption-1', speechId: 'speech-1', roomId: 'hall-a', language: '中文', interpreter: '周雨', text: '我们需要把适应资金与可衡量的社区韧性目标绑定。', revision: 2, at: now }
-  ],
-  audits: [
-    { id: 'audit-1', at: now, roomId: 'hall-a', message: 'Amina Diallo 开始发言，中文频道由周雨接续' },
-    { id: 'audit-2', at: new Date(Date.now() - 90000).toISOString(), roomId: 'hall-a', message: '临时插话申请已插入队列第2位' }
-  ],
-  lowLatency: false
-};
+import {
+  buildCaptionDraft,
+  enqueueOperation,
+  flushJournal,
+  loadInitial,
+  makeSeedJournal,
+  makeSeedState,
+  now,
+  PRIMARY_LANGUAGE,
+  STORAGE_KEY,
+  type ConferenceState,
+  type Journal,
+  type OpDraft,
+  type SpeechStatus
+} from '~/lib/conference';
 
 const captionSchema = z.object({ text: z.string().min(1, '字幕不能为空') });
 const queueSchema = z.object({
@@ -69,35 +30,17 @@ const queueSchema = z.object({
 });
 type QueueForm = z.infer<typeof queueSchema>;
 
-function readState(): ConferenceState {
-  if (typeof localStorage === 'undefined') return seed;
-  try { return JSON.parse(localStorage.getItem('conference-interpretation-v1') ?? 'null') as ConferenceState ?? seed; } catch { return seed; }
-}
-
-const advanceSpeech$ = $((state: ConferenceState, id: string, status: SpeechStatus) => {
-  state.speechQueue = state.speechQueue.map((item) => item.id === id ? { ...item, status, updatedAt: new Date().toISOString() } : item);
-  if (status === 'speaking') {
-    state.speechQueue = state.speechQueue.map((item) => item.id !== id && item.roomId === state.activeRoomId && item.status === 'speaking' ? { ...item, status: 'done' } : item);
-  }
-  state.audits.unshift({ id: crypto.randomUUID(), at: new Date().toISOString(), roomId: state.activeRoomId, message: `发言 ${id} 状态更新为 ${status}` });
-});
-
-const addCaption$ = $((state: ConferenceState, speechId: string, text: string) => {
-  const speech = state.speechQueue.find((item) => item.id === speechId);
-  const channel = state.channels.find((item) => item.roomId === speech?.roomId && item.language === '中文');
-  if (!speech || !channel || !text.trim()) return;
-  const existing = state.captions.find((item) => item.speechId === speechId && item.language === channel.language);
-  if (existing) {
-    state.captions = state.captions.map((item) => item.id === existing.id ? { ...item, text, revision: item.revision + 1, interpreter: channel.interpreter, at: new Date().toISOString() } : item);
-  } else {
-    state.captions.unshift({ id: crypto.randomUUID(), speechId, roomId: speech.roomId, language: channel.language, interpreter: channel.interpreter, text, revision: 1, at: new Date().toISOString() });
-  }
-});
-
 export default component$(() => {
   const locale = useSpeakLocale();
-  const state = useStore<ConferenceState>(readState());
+  // SSR/首屏先给种子数据，客户端 useVisibleTask 再从 localStorage 恢复（含攒批重放）。
+  const initial = typeof window === 'undefined'
+    ? { state: makeSeedState(), journal: makeSeedJournal(), recovered: 0 }
+    : loadInitial(window.localStorage);
+  const state = useStore<ConferenceState>(initial.state, { deep: true });
+  const journal = useStore<Journal>(initial.journal, { deep: true });
+  const recoveredCount = useSignal(initial.recovered);
   const captionLoader = useSignal({ text: '' });
+  const captionist = useSignal('字幕员甲');
   const [captionForm, { Form: CaptionForm, Field: CaptionField }] = useForm<z.infer<typeof captionSchema>>({
     loader: captionLoader,
     validate: zodForm$(captionSchema)
@@ -109,61 +52,166 @@ export default component$(() => {
   });
 
   useVisibleTask$(({ track }) => {
-    track(() => state);
-    localStorage.setItem('conference-interpretation-v1', JSON.stringify(state));
+    // 崩溃恢复：重放日志中所有未应用的攒批操作，恢复到中断前的完整状态。
+    const restored = loadInitial(window.localStorage);
+    if (restored.journal.ops.length > 0 || restored.recovered > 0) {
+      Object.assign(state, restored.state);
+      Object.assign(journal, restored.journal);
+      recoveredCount.value = restored.recovered;
+    }
+  });
+
+  useVisibleTask$(({ track }) => {
+    track(journal);
+    track(state);
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ state, journal }));
   });
 
   const activeRoom = () => state.rooms.find((room) => room.id === state.activeRoomId) ?? state.rooms[0];
   const roomQueue = () => state.speechQueue.filter((item) => item.roomId === state.activeRoomId);
   const roomChannels = () => state.channels.filter((item) => item.roomId === state.activeRoomId);
   const currentSpeech = () => roomQueue().find((item) => item.status === 'speaking');
+  const currentIndex = () => {
+    const queue = roomQueue();
+    const speaking = queue.findIndex((item) => item.status === 'speaking');
+    return speaking >= 0 ? speaking + 1 : 0;
+  };
+  const pendingOps = () => journal.ops.filter((op) => !op.applied);
+  const pendingHealth = () => pendingOps().filter((op) => op.type === 'channel-health').length;
+  const pendingTerms = () => pendingOps().filter((op) => op.type === 'term-approve').length;
+  const currentRevision = () => {
+    const speech = currentSpeech();
+    if (!speech) return 0;
+    const list = state.captionRevisions.filter((item) => item.speechId === speech.id && item.language === PRIMARY_LANGUAGE);
+    return list.length ? list[0].revision : 0;
+  };
+  const latestCaptionText = () => {
+    const speech = currentSpeech();
+    if (!speech) return '';
+    return state.captionRevisions.find((item) => item.speechId === speech.id && item.language === PRIMARY_LANGUAGE)?.text ?? '';
+  };
+
+  const dispatch = $((draft: OpDraft) => {
+    enqueueOperation(journal, state, draft);
+  });
+
+  const toggleLowLatency$ = $(() => {
+    if (!journal.lowLatency) {
+      journal.lowLatency = true;
+      return;
+    }
+    // 退出低延迟：先把攒下的频道健康度/术语变更按发生顺序重算回去，再退出。
+    flushJournal(journal, state);
+    journal.lowLatency = false;
+  });
+
+  const crashRestart$ = $(() => {
+    // 模拟控制台崩溃后重启：未应用操作仍在日志中，重载后由恢复任务按序补算。
+    window.location.reload();
+  });
 
   const selectRoom$ = $((roomId: string) => {
-    state.activeRoomId = roomId;
-    state.audits.unshift({ id: crypto.randomUUID(), at: new Date().toISOString(), roomId, message: `切换到 ${state.rooms.find((room) => room.id === roomId)?.name}` });
+    const room = state.rooms.find((item) => item.id === roomId);
+    if (!room || roomId === state.activeRoomId) return;
+    dispatch({ type: 'room-switch', at: now(), payload: { roomId, roomName: room.name } });
   });
 
   const addSpeech$ = $((values: QueueForm) => {
-    state.speechQueue.push({ id: crypto.randomUUID(), roomId: state.activeRoomId, ...values, remainingSeconds: values.plannedSeconds, status: 'queued', updatedAt: new Date().toISOString() });
-    state.audits.unshift({ id: crypto.randomUUID(), at: new Date().toISOString(), roomId: state.activeRoomId, message: `${values.speaker} 已加入发言队列` });
+    dispatch({
+      type: 'speech-add',
+      at: now(),
+      payload: { speech: { id: crypto.randomUUID(), roomId: state.activeRoomId, ...values, remainingSeconds: values.plannedSeconds, status: 'queued', updatedAt: now() } }
+    });
+  });
+
+  const advanceSpeech$ = $((speechId: string, status: SpeechStatus) => {
+    dispatch({ type: 'speech-advance', at: now(), payload: { speechId, status } });
+  });
+
+  const adjustTime$ = $((speechId: string, deltaSeconds: number) => {
+    dispatch({ type: 'time-adjust', at: now(), payload: { speechId, deltaSeconds } });
   });
 
   const handoff$ = $((channelId: string) => {
-    state.channels = state.channels.map((channel) => channel.id === channelId ? { ...channel, status: 'handoff' } : channel);
-    state.audits.unshift({ id: crypto.randomUUID(), at: new Date().toISOString(), roomId: state.activeRoomId, message: `${channelId} 启动译员交接，原译文版本已冻结` });
+    dispatch({ type: 'handoff-start', at: now(), payload: { channelId } });
   });
 
   const completeHandoff$ = $((channelId: string, interpreter: string) => {
-    state.channels = state.channels.map((channel) => channel.id === channelId ? { ...channel, interpreter, status: 'active', health: Math.min(100, channel.health + 2) } : channel);
-    state.audits.unshift({ id: crypto.randomUUID(), at: new Date().toISOString(), roomId: state.activeRoomId, message: `${interpreter} 接续 ${channelId}，后续字幕归属新译员` });
+    dispatch({ type: 'handoff-complete', at: now(), payload: { channelId, interpreter } });
+  });
+
+  const jitterHealth$ = $((channelId: string) => {
+    const channel = state.channels.find((item) => item.id === channelId);
+    if (!channel) return;
+    const health = Math.max(0, Math.min(100, channel.health + Math.round((Math.random() - 0.5) * 12)));
+    dispatch({ type: 'channel-health', at: now(), payload: { channelId, health } });
   });
 
   const publishCaption$ = $(async (values: z.infer<typeof captionSchema>) => {
     const speech = state.speechQueue.find((item) => item.roomId === state.activeRoomId && item.status === 'speaking');
     if (!speech) return;
-    const queryClient = new QueryClient();
-    const confirmed = await queryClient.fetchQuery({
-      queryKey: ['caption-publish', speech.id, values.text],
-      queryFn: async () => values.text === values.text.trim(),
-      staleTime: 0
-    });
-    if (confirmed) await addCaption$(state, speech.id, values.text);
+    // 同步串行入队，修订号按提交先后分配；两位字幕员连点也不会互相覆盖。
+    const draft = buildCaptionDraft(state, speech.id, captionist.value, values.text);
+    if (draft) enqueueOperation(journal, state, draft);
+    reset(captionForm);
   });
 
-  const approveTerm$ = $((id: string) => {
-    state.terms = state.terms.map((term) => term.id === id ? { ...term, approved: true } : term);
-    state.audits.unshift({ id: crypto.randomUUID(), at: new Date().toISOString(), roomId: state.activeRoomId, message: `术语已批准：${state.terms.find((term) => term.id === id)?.phrase}` });
+  const publishTwoAtOnce$ = $(() => {
+    const speech = currentSpeech();
+    if (!speech) return;
+    dispatch(buildCaptionDraft(state, speech.id, '字幕员甲', '同段修订：字幕员甲先提交的版本')!);
+    dispatch(buildCaptionDraft(state, speech.id, '字幕员乙', '同段修订：字幕员乙紧随其后的版本')!);
   });
+
+  const approveTerm$ = $((termId: string) => {
+    dispatch({ type: 'term-approve', at: now(), payload: { termId } });
+  });
+
+  const roomCaptions = () => {
+    const ids = new Set(roomQueue().map((item) => item.id));
+    return state.captionRevisions.filter((item) => ids.has(item.speechId) && item.language === PRIMARY_LANGUAGE);
+  };
+
+  const formatSeconds = (seconds: number) => `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`;
 
   return (
-    <main class={`conference-shell ${state.lowLatency ? 'low-latency' : ''}`}>
+    <main class={`conference-shell ${journal.lowLatency ? 'low-latency' : ''}`}>
       <header class="hero">
         <div><span class="pill">{locale.lang}</span><h1>同声传译与发言队列</h1><p>{activeRoom().name} · {activeRoom().topic}</p></div>
         <div style="display:flex;gap:12px;flex-wrap:wrap">
           <select value={state.activeRoomId} onChange$={(event) => selectRoom$((event.target as HTMLSelectElement).value)}>{state.rooms.map((room) => <option value={room.id}>{room.name}</option>)}</select>
-          <button class="secondary" onClick$={() => state.lowLatency = !state.lowLatency}>{state.lowLatency ? '退出低延迟' : '低延迟模式'}</button>
+          <button class="secondary" onClick$={toggleLowLatency$}>{journal.lowLatency ? '退出低延迟并补齐更新' : '低延迟模式'}</button>
+          <button class="secondary" onClick$={crashRestart$}>模拟崩溃重启</button>
         </div>
       </header>
+
+      {journal.lowLatency && (
+        <div class="buffer-banner">
+          低延迟直播中：大屏只推送队列位置 / 剩余时间 / 字幕修订号。
+          已攒 <b>{pendingHealth()}</b> 条频道健康度、<b>{pendingTerms()}</b> 条术语变更，退出或重启时按顺序重放（下一序号 #{journal.nextSeq}）。
+        </div>
+      )}
+      {recoveredCount.value > 0 && (
+        <div class="recovery-banner">控制台已从崩溃中恢复：按发生顺序补算了 {recoveredCount.value} 条攒下的更新，序号与修订号保持连续，已应用操作未重复执行。</div>
+      )}
+
+      <section class="board" aria-label="低延迟大屏">
+        <div class="board-cell">
+          <span class="board-label">发言队列当前位置</span>
+          <b class="board-value">{currentIndex() > 0 ? `第 ${currentIndex()} / ${roomQueue().length} 位` : '暂无发言'}</b>
+          <span class="board-sub">{currentSpeech()?.speaker ?? '—'} · {currentSpeech()?.delegation ?? ''}</span>
+        </div>
+        <div class="board-cell">
+          <span class="board-label">当前发言剩余时间</span>
+          <b class="board-value mono">{currentSpeech() ? formatSeconds(currentSpeech()!.remainingSeconds) : '--:--'}</b>
+          <span class="board-sub">{currentSpeech() ? `计划 ${formatSeconds(currentSpeech()!.plannedSeconds)}` : ''}</span>
+        </div>
+        <div class="board-cell">
+          <span class="board-label">字幕修订号</span>
+          <b class="board-value mono">v{currentRevision()}</b>
+          <span class="board-sub">{latestCaptionText() || '尚无字幕'}</span>
+        </div>
+      </section>
 
       <section class="grid">
         <article class="panel">
@@ -174,9 +222,9 @@ export default component$(() => {
               <div><b>{speech.speaker}</b><div style="color:#638087;font-size:13px">{speech.delegation} · {speech.language} · {speech.topic}</div></div>
               <span class="pill">{speech.status}</span>
               <div style="display:flex;gap:6px">
-                {speech.status === 'queued' && <button onClick$={() => advanceSpeech$(state, speech.id, 'speaking')}>开始</button>}
-                {speech.status === 'speaking' && <><button onClick$={() => advanceSpeech$(state, speech.id, 'done')}>结束</button><button class="secondary" onClick$={() => speech.remainingSeconds = Math.max(0, speech.remainingSeconds - 60)}>减1分钟</button></>}
-                {speech.status === 'queued' && <button class="danger" onClick$={() => advanceSpeech$(state, speech.id, 'skipped')}>跳过</button>}
+                {speech.status === 'queued' && <button onClick$={() => advanceSpeech$(speech.id, 'speaking')}>开始</button>}
+                {speech.status === 'speaking' && <><button onClick$={() => advanceSpeech$(speech.id, 'done')}>结束</button><button class="secondary" onClick$={() => adjustTime$(speech.id, -60)}>减1分钟</button></>}
+                {speech.status === 'queued' && <button class="danger" onClick$={() => advanceSpeech$(speech.id, 'skipped')}>跳过</button>}
               </div>
             </div>
           ))}
@@ -191,29 +239,52 @@ export default component$(() => {
           </div>
         </article>
 
-        <aside class="panel">
-          <h2>频道与译员</h2>
+        <aside class="panel buffered-panel">
+          <div style="display:flex;justify-content:space-between;align-items:center"><h2>频道与译员</h2>{journal.lowLatency && <span class="frozen-tag">健康度攒批中 · {pendingHealth()} 条待推</span>}</div>
           {roomChannels().map((channel) => (
             <div style="padding:12px 0;border-bottom:1px solid #e6efee" key={channel.id}>
               <div style="display:flex;justify-content:space-between"><b>{channel.language} · {channel.interpreter}</b><span class="pill">{channel.status}</span></div>
               <div class="decorative" style="margin:8px 0"><Progress.Root value={channel.health} max={100} /></div>
-              <div style="display:flex;gap:8px"><button class="secondary" onClick$={() => handoff$(channel.id)}>开始交接</button>{channel.status === 'handoff' && <button onClick$={() => completeHandoff$(channel.id, `替补译员-${channel.language}`)}>完成交接</button>}</div>
+              {journal.lowLatency
+                ? <div class="frozen-value">健康度 {channel.health}（现场波动先攒着，不推大屏）</div>
+                : <div style="font-size:12px;color:#59747b;margin:6px 0">频道健康度 {channel.health}</div>}
+              <div style="display:flex;gap:8px;flex-wrap:wrap">
+                <button class="secondary" onClick$={() => jitterHealth$(channel.id)}>模拟现场波动</button>
+                <button class="secondary" onClick$={() => handoff$(channel.id)}>开始交接</button>
+                {channel.status === 'handoff' && <button onClick$={() => completeHandoff$(channel.id, `替补译员-${channel.language}`)}>完成交接</button>}
+              </div>
+              {channel.relievedSpeechId && <div class="handoff-note">接班仅服务当前发言，主持人切下一位后频道交还 {channel.previousInterpreter}</div>}
             </div>
           ))}
-          <h3>实时字幕修正</h3>
-          {currentSpeech() ? <CaptionForm onSubmit$={publishCaption$}><CaptionField name="text">{(field, props) => <textarea {...props} rows={3} value={field.value} onInput$={(event) => field.value = (event.target as HTMLTextAreaElement).value} placeholder="输入或修正当前字幕" />}</CaptionField><button type="submit">提交新版字幕</button></CaptionForm> : <p>当前没有发言中的代表。</p>}
-          {state.captions.filter((caption) => caption.roomId === state.activeRoomId).map((caption) => <div style="margin-top:10px;padding:10px;background:#f1f8f7;border-radius:10px" key={caption.id}><b>{caption.interpreter} · v{caption.revision}</b><p>{caption.text}</p></div>)}
+          <h3>实时字幕修正（修订按提交先后排队，不互相覆盖）</h3>
+          {currentSpeech() ? <>
+            <select value={captionist.value} onChange$={(event) => captionist.value = (event.target as HTMLSelectElement).value}>
+              <option>字幕员甲</option>
+              <option>字幕员乙</option>
+            </select>
+            <CaptionForm onSubmit$={publishCaption$}>
+              <CaptionField name="text">{(field, props) => <textarea {...props} rows={3} value={field.value} onInput$={(event) => field.value = (event.target as HTMLTextAreaElement).value} placeholder="输入或修正当前字幕" />}</CaptionField>
+              <button type="submit" style="margin-top:8px">提交新版字幕</button>
+            </CaptionForm>
+            <button class="secondary" style="margin-top:8px" onClick$={publishTwoAtOnce$}>模拟两位字幕员同时提交同一段</button>
+          </> : <p>当前没有发言中的代表。</p>}
+          {roomCaptions().map((caption) => (
+            <div style="margin-top:10px;padding:10px;background:#f1f8f7;border-radius:10px" key={caption.id}>
+              <b>v{caption.revision} · 译员：{caption.interpreter} · {caption.captionist} · #{caption.seq}</b>
+              <p style="margin:6px 0 0">{caption.text}</p>
+            </div>
+          ))}
         </aside>
       </section>
 
       <section class="grid" style="margin-top:18px">
-        <article class="panel">
-          <h2>术语库</h2>
-          {state.terms.map((term) => <div class="queue-row" key={term.id}><span/><div><b>{term.phrase}</b><div>{term.translation} · {term.language}</div></div><span class="pill">{term.approved ? '已批准' : '待审'}</span><button disabled={term.approved} onClick$={() => approveTerm$(term.id)}>批准</button></div>)}
+        <article class="panel buffered-panel">
+          <div style="display:flex;justify-content:space-between;align-items:center"><h2>术语库</h2>{journal.lowLatency && <span class="frozen-tag">术语变更攒批中 · {pendingTerms()} 条待推</span>}</div>
+          {state.terms.map((term) => <div class="queue-row" key={term.id}><span /><div><b>{term.phrase}</b><div>{term.translation} · {term.language}</div></div><span class="pill">{term.approved ? '已批准' : '待审'}</span><button disabled={term.approved} onClick$={() => approveTerm$(term.id)}>批准</button></div>)}
         </article>
         <article class="panel">
-          <h2>操作与交接时间线</h2>
-          {state.audits.filter((audit) => audit.roomId === state.activeRoomId).slice(0, 10).map((audit) => <div style="padding:10px 0;border-bottom:1px solid #e6efee" key={audit.id}><small>{new Date(audit.at).toLocaleTimeString()}</small><div>{audit.message}</div></div>)}
+          <h2>操作与交接时间线（按日志序号）</h2>
+          {state.audits.filter((audit) => audit.roomId === state.activeRoomId).sort((a, b) => b.seq - a.seq).slice(0, 12).map((audit) => <div style="padding:10px 0;border-bottom:1px solid #e6efee" key={audit.id}><small>#{audit.seq} · {new Date(audit.at).toLocaleTimeString()}</small><div>{audit.message}</div></div>)}
         </article>
       </section>
     </main>
@@ -222,5 +293,5 @@ export default component$(() => {
 
 export const head: DocumentHead = {
   title: '国际会议同声传译控制台',
-  meta: [{ name: 'description', content: '发言队列、多语种频道、术语、译员交接与实时字幕修正原型' }]
+  meta: [{ name: 'description', content: '发言队列、多语种频道、术语、译员交接与实时字幕修正原型，低延迟模式支持事件日志与崩溃恢复' }]
 };
