@@ -16,4 +16,12 @@ button.secondary { background:#e1eeee; color:#18565a; }
 button.danger { background:#c2413b; }
 input, select, textarea { width:100%; border:1px solid #bdd3d2; border-radius:9px; padding:8px 10px; background:white; }
 .low-latency .decorative { display:none; }
+.low-latency .non-essential { display:none; }
+.big-screen { border-color:#0d7772; }
+.big-screen-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:16px; }
+.big-stat { background:linear-gradient(135deg,#0d7772,#0a5a56); color:#fff; border-radius:14px; padding:22px; display:flex; flex-direction:column; gap:8px; }
+.big-label { font-size:13px; letter-spacing:.08em; opacity:.85; }
+.big-value { font-size:clamp(28px,5vw,44px); font-weight:700; letter-spacing:-.02em; line-height:1; }
+.big-hint { margin:14px 0 0; color:#59747b; font-size:13px; }
+@media(max-width:900px){ .big-screen-grid{grid-template-columns:1fr} }
 @media(max-width:900px){ .grid{grid-template-columns:1fr}.queue-row{grid-template-columns:36px 1fr}.queue-row>*:nth-child(n+3){display:none}.hero{align-items:flex-start;flex-direction:column} }
